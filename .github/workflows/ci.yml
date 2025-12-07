@@ -1,0 +1,164 @@
+name: CI - Terraform & Tests
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  lint-and-format:
+    name: Linting & Format Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: 1.14.1
+
+      - name: Terraform fmt (check)
+        run: terraform -chdir=terraform/envs/dev fmt -check -recursive
+
+  static-analysis:
+    name: Static Analysis & Security Scanning
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: 1.14.1
+
+      - name: Install prerequisites
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y unzip python3-pip curl
+
+      - name: Install tfsec
+        run: |
+          curl -sSLf https://raw.githubusercontent.com/aquasecurity/tfsec/main/scripts/install_linux.sh | bash
+
+      - name: Install checkov
+        run: |
+          python3 -m pip install --upgrade pip
+          pip3 install checkov
+
+      - name: Terraform validate
+        run: terraform -chdir=terraform/envs/dev init -backend=false && terraform -chdir=terraform/envs/dev validate
+
+      - name: Run tfsec (security scan)
+        run: tfsec terraform --format json --output tfsec-report.json || true
+        continue-on-error: true
+
+      - name: Run checkov (policy check)
+        run: checkov -d terraform --framework terraform --output json > checkov-report.json || true
+        continue-on-error: true
+
+      - name: Upload security reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-reports
+          path: |
+            tfsec-report.json
+            checkov-report.json
+
+  # unit-tests:
+  #   name: Terratest Unit Tests (skipped for test assignment)
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - name: Note
+  #       run: echo "Unit tests require AWS credentials and are skipped for this test assignment"
+
+  docker-build:
+    name: Docker Build Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Build backend image
+        uses: docker/build-push-action@v4
+        with:
+          context: ./app/backend
+          push: false
+          tags: iaac-backend:test
+
+      - name: Build frontend image
+        uses: docker/build-push-action@v4
+        with:
+          context: ./app/frontend
+          push: false
+          tags: iaac-frontend:test
+
+  integration-tests:
+    name: Integration Tests (Docker Compose)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Compose
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y docker-compose
+
+      - name: Build and start services
+        working-directory: infra
+        run: |
+          docker-compose up -d --build
+          sleep 10
+
+      - name: Test backend health
+        run: |
+          curl -f http://localhost:5000/health || exit 1
+          echo "Backend health check passed"
+
+      - name: Test frontend
+        run: |
+          curl -f http://localhost:80/ || exit 1
+          echo "Frontend check passed"
+
+      - name: Test API endpoint
+        run: |
+          curl -f http://localhost:5000/ || exit 1
+          echo "API endpoint check passed"
+
+      - name: View logs on failure
+        if: failure()
+        working-directory: infra
+        run: docker-compose logs
+
+      - name: Cleanup
+        if: always()
+        working-directory: infra
+        run: docker-compose down -v
+
+  plan-on-pr:
+    name: Terraform Plan (PR)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    needs: [ lint-and-format, static-analysis, docker-build, integration-tests ]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: 1.14.1
+      - name: Terraform init
+        run: terraform -chdir=terraform/envs/dev init -backend=false
+      - name: Terraform plan
+        run: terraform -chdir=terraform/envs/dev plan -input=false -no-color -out=tfplan
+      - name: Upload plan artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan
+          path: terraform/envs/dev/tfplan

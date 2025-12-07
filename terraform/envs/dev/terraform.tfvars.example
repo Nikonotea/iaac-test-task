@@ -1,0 +1,6 @@
+# Terraform variables example
+# Copy this to terraform.tfvars and set actual values
+db_password     = "your_secure_password_here"
+key_name        = "your-ec2-key-pair-name"  # Optional
+frontend_bucket = "your-frontend-bucket-unique-name"
+aws_region      = "us-east-1"
